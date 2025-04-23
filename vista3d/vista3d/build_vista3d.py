@@ -10,7 +10,7 @@
 # limitations under the License.
 
 
-from .modeling import VISTA3D2, Class_Mapping_Classify, Point_Mapping_SAM, SegResNetDS2
+from .modeling import VISTA3D2, Class_Mapping_Classify, Point_Mapping_SAM, SegResNetDS2, Text_Mapping
 
 
 def build_vista3d_segresnet_decoder(
@@ -23,6 +23,10 @@ def build_vista3d_segresnet_decoder(
         out_channels=encoder_embed_dim,
         init_filters=encoder_embed_dim,
         dsdepth=1,
+    )
+    text_head = Text_Mapping(
+        feature_size=encoder_embed_dim,
+        text_embedding_dim=768,
     )
     point_head = Point_Mapping_SAM(feature_size=encoder_embed_dim, last_supported=132)
     class_head = Class_Mapping_Classify(

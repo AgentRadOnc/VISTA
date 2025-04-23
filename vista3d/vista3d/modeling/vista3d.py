@@ -26,11 +26,21 @@ PINF_VALUE = 9999
 
 
 class VISTA3D2(nn.Module):
-    def __init__(self, image_encoder, class_head, point_head, feature_size):
+    def __init__(self, image_encoder, class_head, point_head, text_head, feature_size):
+        """Initialize the VISTA3D2 model.
+        
+        Args:
+            image_encoder: Encoder network for processing input images
+            class_head: Network head for class-based segmentation
+            point_head: Network head for point-based segmentation
+            text_head: Network head for text-based segmentation
+            feature_size: Size of feature vectors produced by the encoder
+        """
         super().__init__()
         self.image_encoder = image_encoder
         self.class_head = class_head
         self.point_head = point_head
+        self.text_head = text_head
         self.image_embeddings = None
         self.weight_mapper = nn.Sequential(
             nn.Linear(feature_size, 4 * feature_size),
@@ -42,13 +52,35 @@ class VISTA3D2(nn.Module):
         self.point_freeze = False
 
     def precompute_embedding(self, input_images):
-        """precompute image embedding, require sliding window inference"""
+        """Precompute image embeddings for later use.
+        
+        This method requires sliding window inference to handle large volumes.
+        
+        Args:
+            input_images: Input image tensor
+            
+        Raises:
+            NotImplementedError: This method needs to be implemented in subclasses
+        """
         raise NotImplementedError
 
     def clear_cache(self):
+        """Clear cached image embeddings to free memory."""
         self.image_embeddings = None
 
     def get_bs(self, class_vector, point_coords):
+        """Get batch size from either class vector or point coordinates.
+        
+        Args:
+            class_vector: Class vector tensor of shape [B, 1]
+            point_coords: Point coordinates tensor of shape [B, N, 3]
+            
+        Returns:
+            int: Batch size
+            
+        Raises:
+            AssertionError: If both class_vector and point_coords are None
+        """
         if class_vector is None:
             assert point_coords is not None, "prompt is required"
             return point_coords.shape[0]
@@ -56,8 +88,19 @@ class VISTA3D2(nn.Module):
             return class_vector.shape[0]
 
     def update_point_to_patch(self, patch_coords, point_coords, point_labels):
-        """Update point_coords with respect to patch coords.
-        If point is outside of the patch, remove the coordinates and set label to -1
+        """Update point coordinates with respect to patch coordinates.
+        
+        This method transforms global point coordinates to local patch coordinates
+        and filters out points that fall outside the current patch.
+        
+        Args:
+            patch_coords: Slice object representing patch coordinates
+            point_coords: Tensor of shape [B, N, 3] containing point coordinates
+            point_labels: Tensor of shape [B, N] containing point labels
+            
+        Returns:
+            tuple: (updated_point_coords, updated_point_labels) - Points transformed to patch space
+                  Returns (None, None) if no points fall within the patch
         """
         patch_ends = [
             patch_coords[-3].stop,
@@ -103,10 +146,26 @@ class VISTA3D2(nn.Module):
     def connected_components_combine(
         self, logits, point_logits, point_coords, point_labels, mapping_index, thred=0.5
     ):
-        """Combine auto results with point click response, or combine previous mask with point click response.
-        For mapping_index with point clicks, NaN values in logits will be replaced with point_logits. Meanwhile, the added/removed
-        region in point clicks must be updated by the lcc function. Notice, if a positive point is within logits/prev_mask, the components containing the positive point
-        will be added.
+        """Combine auto-segmentation results with point click responses, or combine previous mask with point click responses.
+        
+        This method integrates point-based corrections with existing segmentation masks using connected component analysis.
+        
+        Args:
+            logits: Tensor of shape [B, 1, H, W, D] - The existing segmentation logits (auto-segmentation or previous mask)
+            point_logits: Tensor of shape [B', 1, H, W, D] - The point-based segmentation logits
+            point_coords: List of tensors [B', N, 3] - Coordinates of clicked points
+            point_labels: List of tensors [B', N] - Labels of clicked points (1=positive, 0=negative)
+            mapping_index: Boolean tensor [B] - Indicates which batch elements have valid point clicks
+            thred: float - Threshold value for sigmoid activation (default: 0.5)
+            
+        Returns:
+            Updated logits tensor with point corrections applied
+            
+        Process:
+            1. For regions with NaN values in logits, replace with point_logits
+            2. For positive points within existing mask, add connected components containing those points
+            3. For negative points, remove corresponding regions from the mask
+            4. Connected component analysis ensures spatial coherence of corrections
         """
         logits = (
             logits.as_tensor() if isinstance(logits, monai.data.MetaTensor) else logits
@@ -162,7 +221,22 @@ class VISTA3D2(nn.Module):
     def gaussian_combine(
         self, logits, point_logits, point_coords, point_labels, mapping_index, radius
     ):
-        """Combine point results with auto results using gaussian."""
+        """Combine point-based and auto-segmentation results using Gaussian weighting.
+        
+        This method blends the two segmentation results with a spatial Gaussian weight
+        centered around the clicked points.
+        
+        Args:
+            logits: Tensor of shape [B, 1, H, W, D] - The auto-segmentation logits
+            point_logits: Tensor of shape [B', 1, H, W, D] - The point-based segmentation logits
+            point_coords: List of tensors [B', N, 3] - Coordinates of clicked points
+            point_labels: List of tensors [B', N] - Labels of clicked points
+            mapping_index: Boolean tensor [B] - Indicates which batch elements have valid point clicks
+            radius: float or None - Radius of Gaussian influence around points (if None, uses 1/5 of min dimension)
+            
+        Returns:
+            Updated logits tensor with Gaussian-weighted combination of auto and point results
+        """
         if radius is None:
             radius = min(point_logits.shape[-3:]) // 5  # empirical value 5
         weight = 1 - convert_points_to_disc(
@@ -177,7 +251,15 @@ class VISTA3D2(nn.Module):
         return logits
 
     def set_auto_grad(self, auto_freeze=False, point_freeze=False):
-        """Freeze auto-branch or point-branch"""
+        """Control gradient flow by selectively freezing model components.
+        
+        This method allows freezing either the automatic segmentation branch or
+        the point-based segmentation branch for targeted training.
+        
+        Args:
+            auto_freeze: bool - Whether to freeze the automatic segmentation branch
+            point_freeze: bool - Whether to freeze the point-based segmentation branch
+        """
         if auto_freeze != self.auto_freeze:
             if hasattr(self.image_encoder, "set_auto_grad"):
                 self.image_encoder.set_auto_grad(
@@ -205,6 +287,7 @@ class VISTA3D2(nn.Module):
     def forward(
         self,
         input_images,
+        text_embeddings=None,
         point_coords=None,
         point_labels=None,
         class_vector=None,
@@ -217,32 +300,37 @@ class VISTA3D2(nn.Module):
         val_point_sampler=None,
         **kwargs,
     ):
-        """
-        The forward function for VISTA3D. We only support single patch in training and inference.
-        One exception is allowing sliding window batch size > 1 for automatic segmentation only case.
-        B represents number of objects, N represents number of points for each objects.
+        """Forward pass for VISTA3D model supporting multiple segmentation modes.
+        
+        This method handles class-based, point-based, and text-based segmentation,
+        as well as combinations of these approaches. It supports both training and
+        inference modes, including sliding window inference for large volumes.
+        
         Args:
-            input_images: [1, 1, H, W, D]
-            point_coords: [B, N, 3]
-            point_labels: [B, N], -1 represents padding. 0/1 means negative/positive points for regular class.
-                          2/3 means negative/postive ponits for special supported class like tumor.
-            class_vector: [B, 1], the global class index
-            prompt_class: [B, 1], the global class index. This value is associated with point_coords to identify if
-                          the points are for zero-shot or supported class. When class_vector and point_coords are both
-                          provided, prompt_class is the same as class_vector. For prompt_class[b] > 512, point_coords[b]
-                          will be considered novel class.
-            patch_coords: the python slice object representing the patch coordinates during sliding window inference. This value is
-                          passed from monai_utils.sliding_window_inferer. This is an indicator for training phase or validation phase.
-            labels: [1, 1, H, W, D], the groundtruth label tensor, only used for point-only evaluation
-            label_set: the label index matching the indexes in labels. If labels are mapped to global index using RelabelID,
-                       this label_set should be global mapped index. If labels are not mapped to global index, e.g. in zero-shot
-                       evaluation, this label_set should be the original index.
-            prev_mask: [B, N, H_fullsize, W_fullsize, D_fullsize]. This is the transposed raw output from sliding_window_inferer before
-                       any postprocessing. When user click points to perform auto-results correction, this can be the auto-results.
-            radius: single float value controling the gaussian blur when combining point and auto results. The gaussian combine is not used
-                    in VISTA3D training but might be useful for finetuning purposes.
-            val_point_sampler: function used to sample points from labels. This is only used for point-only evaluation.
-
+            input_images: Tensor [1, 1, H, W, D] - Input 3D image
+            text_embeddings: Optional tensor - Text prompt embeddings for text-based segmentation
+            point_coords: Optional tensor [B, N, 3] - Coordinates of clicked points
+            point_labels: Optional tensor [B, N] - Labels of clicked points (-1=padding, 0=negative, 1=positive)
+            class_vector: Optional tensor [B, 1] - Class indices for class-based segmentation
+            prompt_class: Optional tensor [B, 1] - Class indices associated with point prompts
+            patch_coords: Optional slice object - Coordinates of current patch in sliding window inference
+            labels: Optional tensor [1, 1, H, W, D] - Ground truth labels for point-only evaluation
+            label_set: Optional list - Label indices matching the indexes in labels
+            prev_mask: Optional tensor [B, N, H, W, D] - Previous segmentation mask for refinement
+            radius: Optional float - Radius for Gaussian combination of auto and point results
+            val_point_sampler: Optional function - Function to sample points from labels for evaluation
+            **kwargs: Additional keyword arguments
+                - keep_cache: bool - Whether to cache image embeddings for future use
+        
+        Returns:
+            Tensor [B, 1, H, W, D] - Segmentation logits
+            
+        Notes:
+            - The method supports three main segmentation modes: class-based, point-based, and text-based
+            - For class-based segmentation with point refinement, results are combined using either
+              Gaussian weighting (during training) or connected components (during validation)
+            - For point-only segmentation with a previous mask, connected components are used for refinement
+            - Memory management is handled by clearing unused tensors and optionally caching embeddings
         """
         image_size = input_images.shape[-3:]
         device = input_images.device
@@ -285,7 +373,7 @@ class VISTA3D2(nn.Module):
                 else:
                     point_coords, point_labels = None, None
 
-        if point_coords is None and class_vector is None:
+        if point_coords is None and class_vector is None and text_embeddings is None:
             return NINF_VALUE + torch.zeros([bs, 1, *image_size], device=device)
 
         if (
@@ -324,6 +412,8 @@ class VISTA3D2(nn.Module):
                     logits = self.connected_components_combine(
                         logits, point_logits, point_coords, point_labels, mapping_index
                     )
+        elif text_embeddings is not None:
+            logits = self.text_head(out, text_embeddings=text_embeddings)
         else:
             logits = NINF_VALUE + torch.zeros(
                 [bs, 1, *image_size], device=device, dtype=out.dtype

@@ -235,3 +235,4 @@ class Text_Mapping(nn.Module):
         # Combine batch results
         masks = torch.cat(masks, dim=0)
         return masks
+```
